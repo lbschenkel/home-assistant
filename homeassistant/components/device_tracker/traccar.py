@@ -4,7 +4,7 @@ Support for Traccar device tracking.
 For more details about this platform, please refer to the documentation at
 https://home-assistant.io/components/device_tracker.traccar/
 """
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
 
 import voluptuous as vol
@@ -14,6 +14,7 @@ from homeassistant.const import (
     CONF_HOST, CONF_PORT, CONF_SSL, CONF_VERIFY_SSL,
     CONF_PASSWORD, CONF_USERNAME, ATTR_BATTERY_LEVEL)
 import homeassistant.helpers.config_validation as cv
+import homeassistant.util.dt as dt_util
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import slugify
@@ -62,6 +63,8 @@ class TraccarScanner:
         self._async_see = async_see
         self._api = api
         self._hass = hass
+        self._interval = DEFAULT_SCAN_INTERVAL
+        self._last_seen = {}
 
     async def async_init(self):
         """Further initialize connection to Traccar."""
@@ -70,7 +73,7 @@ class TraccarScanner:
             await self._async_update()
             async_track_time_interval(self._hass,
                                       self._async_update,
-                                      DEFAULT_SCAN_INTERVAL)
+                                      self._interval)
 
         return self._api.authenticated
 
@@ -80,6 +83,7 @@ class TraccarScanner:
         await self._api.get_device_info()
         for devicename in self._api.device_info:
             device = self._api.device_info[devicename]
+            device_id = device['device_id']
             attr = {}
             attr[ATTR_TRACKER] = 'traccar'
             if device.get('address') is not None:
@@ -94,7 +98,21 @@ class TraccarScanner:
                 attr[ATTR_BATTERY_LEVEL] = device['battery']
             if device.get('motion') is not None:
                 attr[ATTR_MOTION] = device['motion']
-            await self._async_see(
-                dev_id=slugify(device['device_id']),
-                gps=(device.get('latitude'), device.get('longitude')),
-                attributes=attr)
+            if device.get('updated') is not None:
+                updated = dt_util.parse_datetime(device['updated'])
+            else:
+                updated = dt_util.utcnow()
+            # Only 'see' the device if the position in Traccar has been updated since last poll,
+            # otherwise the position is always considered fresh in HASS and never goes stale.
+            last_seen = self._last_seen.get(device_id)
+            if last_seen is None:
+                last_seen = dt_util.utcnow() - self._interval
+            if (last_seen < updated):
+                _LOGGER.warn("Position for " + device_id + " has changed, refreshing HASS state")
+                await self._async_see(
+                    dev_id=slugify(device_id),
+                    gps=(device.get('latitude'), device.get('longitude')),
+                    attributes=attr)
+            else:
+                _LOGGER.warn("Position for " + device_id + " has not changed")
+            self._last_seen[device_id] = updated
